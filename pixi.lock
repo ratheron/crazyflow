@@ -2220,6 +2220,7 @@ packages:
   - matplotlib ; extra == 'benchmark'
   - pandas ; extra == 'benchmark'
   requires_python: '>=3.11,<3.14'
+  editable: true
 - pypi: https://files.pythonhosted.org/packages/64/16/ed058e1df0f33d440217cd120d41d5dda9dd215a80b8187f68483185af82/cryptography-47.0.0-cp311-abi3-manylinux_2_28_x86_64.whl
   name: cryptography
   version: 47.0.0
@@ -2298,6 +2299,7 @@ packages:
   - scipy>=1.17.0
   - array-api-compat
   - array-api-extra
+  editable: true
 - pypi: ./submodules/drone-models
   name: drone-models
   version: 0.1.0
@@ -2310,6 +2312,7 @@ packages:
   - array-api-extra
   - matplotlib ; extra == 'sysid'
   - jax>=0.7 ; extra == 'sysid'
+  editable: true
 - pypi: https://files.pythonhosted.org/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl
   name: einops
   version: 0.8.2

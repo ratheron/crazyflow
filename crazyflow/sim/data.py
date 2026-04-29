@@ -21,6 +21,17 @@ from crazyflow.sim.physics import (
     SoRpyRotorDragData,
 )
 
+DEFAULT_UWB_BASE_STATIONS = (
+    (-2.5, -2.5, 0.0),
+    (-2.5, 2.5, 0.0),
+    (2.5, -2.5, 0.0),
+    (2.5, 2.5, 0.0),
+    (-2.5, -2.5, 3.0),
+    (-2.5, 2.5, 3.0),
+    (2.5, -2.5, 3.0),
+    (2.5, 2.5, 3.0),
+)
+
 
 @dataclass
 class SimState:
@@ -54,6 +65,68 @@ class SimState:
             force=zeros_3d,
             torque=zeros_3d,
             rotor_vel=rotor_vel,
+        )
+
+
+@dataclass
+class SimEstimates:
+    pos: Array  # (N, M, 3)
+    """Estimated position of the drone's center of mass."""
+    quat: Array  # (N, M, 4)
+    """Estimated quaternion of the drone's orientation."""
+    vel: Array  # (N, M, 3)
+    """Estimated velocity of the drone's center of mass in the world frame."""
+    ang_vel: Array  # (N, M, 3)
+    """Estimated angular velocity of the drone in the world frame."""
+    covariance: Array  # (N, M, 6, 6)
+    """Position/velocity estimator covariance."""
+    use_for_control: Array  # (N, 1, 1)
+    """Whether the controller should consume estimated state for each world."""
+
+    @staticmethod
+    def create(n_worlds: int, n_drones: int, device: Device) -> SimEstimates:
+        """Create a default state estimate for the simulation."""
+        zeros_3d = jnp.zeros((n_worlds, n_drones, 3), device=device)
+        q_identity = jnp.zeros((n_worlds, n_drones, 4), device=device)
+        q_identity = q_identity.at[..., -1].set(1.0)
+        covariance = jnp.tile(
+            jnp.eye(6, device=device)[None, None, :, :], (n_worlds, n_drones, 1, 1)
+        )
+        use_for_control = jnp.zeros((n_worlds, 1, 1), dtype=jnp.bool_, device=device)
+        return SimEstimates(
+            pos=zeros_3d,
+            quat=q_identity,
+            vel=zeros_3d,
+            ang_vel=zeros_3d,
+            covariance=covariance,
+            use_for_control=use_for_control,
+        )
+
+
+@dataclass
+class UWBData:
+    base_stations: Array  # (8, 3)
+    """UWB base station positions in the world frame."""
+    ranges: Array  # (N, M, 8)
+    """Latest measured UWB ranges from each drone to each base station."""
+    range_std: Array  # (N, M, 1)
+    """Standard deviation of the range noise in meters."""
+    steps: Array  # (N, 1)
+    """Last simulation steps that UWB ranges were updated."""
+    freq: int = field(pytree_node=False)
+    """Frequency of UWB communication."""
+
+    @staticmethod
+    def create(
+        n_worlds: int, n_drones: int, freq: int, device: Device, range_std: float = 0.05
+    ) -> UWBData:
+        """Create default UWB sensing data."""
+        base_stations = jnp.array(DEFAULT_UWB_BASE_STATIONS, device=device)
+        ranges = jnp.zeros((n_worlds, n_drones, base_stations.shape[0]), device=device)
+        range_std = jnp.full((n_worlds, n_drones, 1), range_std, device=device)
+        steps = -jnp.ones((n_worlds, 1), dtype=jnp.int32, device=device)
+        return UWBData(
+            base_stations=base_stations, ranges=ranges, range_std=range_std, steps=steps, freq=freq
         )
 
 
@@ -256,6 +329,10 @@ class SimData:
     """State of the simulation."""
     states_deriv: SimStateDeriv
     """Derivative of the state of the simulation."""
+    estimates: SimEstimates
+    """Estimated state of the simulation."""
+    uwb: UWBData
+    """UWB sensing data."""
     controls: SimControls
     """Drone controller data."""
     params: SimParams

@@ -21,7 +21,16 @@ from jax import Array, Device
 import crazyflow.sim.functional as F
 from crazyflow.control.control import Control, controllable
 from crazyflow.exception import ConfigError, NotInitializedError
-from crazyflow.sim.data import SimControls, SimCore, SimData, SimParams, SimState, SimStateDeriv
+from crazyflow.sim.data import (
+    SimControls,
+    SimCore,
+    SimData,
+    SimEstimates,
+    SimParams,
+    SimState,
+    SimStateDeriv,
+    UWBData,
+)
 from crazyflow.sim.integration import Integrator, euler, rk4, symplectic_euler
 from crazyflow.sim.physics import (
     Physics,
@@ -343,9 +352,12 @@ class Sim:
         """Initialize the simulation data."""
         drone_ids = [self.mj_model.body(f"drone:{i}").id for i in range(self.n_drones)]
         N, D = self.n_worlds, self.n_drones
+        uwb_freq = state_freq if state_freq is not None and state_freq > 0 else 100
         data = SimData(
             states=SimState.create(N, D, self.device),
             states_deriv=SimStateDeriv.create(N, D, self.device),
+            estimates=SimEstimates.create(N, D, self.device),
+            uwb=UWBData.create(N, D, uwb_freq, self.device),
             controls=SimControls.create(
                 N,
                 D,
@@ -362,7 +374,8 @@ class Sim:
         if D > 1:  # If multiple drones, arrange them in a grid
             grid = grid_2d(D)
             states = data.states.replace(pos=data.states.pos.at[..., :2].set(grid))
-            data = data.replace(states=states)
+            estimates = data.estimates.replace(pos=states.pos, quat=states.quat)
+            data = data.replace(states=states, estimates=estimates)
         return data
 
     @property
@@ -511,9 +524,20 @@ def sync_sim2mjx(data: SimData, mjx_data: Data, mjx_model: Model) -> tuple[SimDa
     return data, mjx_data
 
 
+def controller_states(data: SimData) -> SimState:
+    """Return the state source currently selected for controller feedback."""
+    use_estimate = data.estimates.use_for_control
+    return data.states.replace(
+        pos=jnp.where(use_estimate, data.estimates.pos, data.states.pos),
+        quat=jnp.where(use_estimate, data.estimates.quat, data.states.quat),
+        vel=jnp.where(use_estimate, data.estimates.vel, data.states.vel),
+        ang_vel=jnp.where(use_estimate, data.estimates.ang_vel, data.states.ang_vel),
+    )
+
+
 def step_state_controller(data: SimData) -> SimData:
     """Compute the updated controls for the state controller."""
-    states = data.states
+    states = controller_states(data)
     state_ctrl: MellingerStateData = data.controls.state
     assert state_ctrl is not None, "Using state controller without initialized data"
     mask = controllable(data.core.steps, data.core.freq, state_ctrl.steps, state_ctrl.freq)
@@ -535,7 +559,7 @@ def step_state_controller(data: SimData) -> SimData:
 
 def step_attitude_controller(data: SimData) -> SimData:
     """Compute the updated controls for the attitude controller."""
-    states = data.states
+    states = controller_states(data)
     attitude_ctrl: MellingerAttitudeData = data.controls.attitude
     assert attitude_ctrl is not None, "Using attitude controller without initialized data"
     mask = controllable(data.core.steps, data.core.freq, attitude_ctrl.steps, attitude_ctrl.freq)
@@ -562,7 +586,7 @@ def step_attitude_controller(data: SimData) -> SimData:
         data.controls.force_torque, mask, staged_cmd=jnp.concat([force, torque], axis=-1)
     )
     return data.replace(
-        states=states, controls=data.controls.replace(attitude=attitude_ctrl, force_torque=ft_ctrl)
+        controls=data.controls.replace(attitude=attitude_ctrl, force_torque=ft_ctrl)
     )
 
 
