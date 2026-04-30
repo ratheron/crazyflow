@@ -6,3 +6,6 @@
 	path = submodules/drone-controllers
 	url = https://github.com/learnsyslab/drone-controllers.git
 	branch = main
+[submodule "submodules/drone-estimators"]
+	path = submodules/drone-estimators
+	url = git@github.com:learnsyslab/drone-estimators.git

@@ -22,6 +22,7 @@ import crazyflow.sim.functional as F
 from crazyflow.control.control import Control, controllable
 from crazyflow.exception import ConfigError, NotInitializedError
 from crazyflow.sim.data import (
+    IMUData,
     SimControls,
     SimCore,
     SimData,
@@ -358,6 +359,7 @@ class Sim:
             states_deriv=SimStateDeriv.create(N, D, self.device),
             estimates=SimEstimates.create(N, D, self.device),
             uwb=UWBData.create(N, D, uwb_freq, self.device),
+            imu=IMUData.create(N, D, self.device),
             controls=SimControls.create(
                 N,
                 D,

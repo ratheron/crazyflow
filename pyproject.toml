@@ -126,6 +126,7 @@ ruff = "*"
 crazyflow = { path = "./", editable = true }
 drone-models = { path = "./submodules/drone-models", editable = true }
 drone-controllers = { path = "./submodules/drone-controllers", editable = true }
+drone-estimators = { path = "./submodules/drone-estimators", editable = true }
 
 [tool.pixi.feature.gpu]
 platforms = ["linux-64"]

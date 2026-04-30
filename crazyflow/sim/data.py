@@ -78,8 +78,12 @@ class SimEstimates:
     """Estimated velocity of the drone's center of mass in the world frame."""
     ang_vel: Array  # (N, M, 3)
     """Estimated angular velocity of the drone in the world frame."""
-    covariance: Array  # (N, M, 6, 6)
-    """Position/velocity estimator covariance."""
+    accel_bias: Array  # (N, M, 3)
+    """Estimated accelerometer bias in m/s^2."""
+    gyro_bias: Array  # (N, M, 3)
+    """Estimated gyroscope bias in rad/s."""
+    covariance: Array  # (N, M, 19, 19)
+    """Full-state estimator covariance for [pos, quat, vel, ang_vel, accel_bias, gyro_bias]."""
     use_for_control: Array  # (N, 1, 1)
     """Whether the controller should consume estimated state for each world."""
 
@@ -89,15 +93,39 @@ class SimEstimates:
         zeros_3d = jnp.zeros((n_worlds, n_drones, 3), device=device)
         q_identity = jnp.zeros((n_worlds, n_drones, 4), device=device)
         q_identity = q_identity.at[..., -1].set(1.0)
-        covariance = jnp.tile(
-            jnp.eye(6, device=device)[None, None, :, :], (n_worlds, n_drones, 1, 1)
+        cov_diag = jnp.array(
+            [
+                2.5e-3,
+                2.5e-3,
+                2.5e-3,
+                1e-6,
+                1e-6,
+                1e-6,
+                1e-6,
+                1e-2,
+                1e-2,
+                1e-2,
+                1e-4,
+                1e-4,
+                1e-4,
+                1e-4,
+                1e-4,
+                1e-4,
+                1e-8,
+                1e-8,
+                1e-8,
+            ],
+            device=device,
         )
+        covariance = jnp.tile(jnp.diag(cov_diag)[None, None, :, :], (n_worlds, n_drones, 1, 1))
         use_for_control = jnp.zeros((n_worlds, 1, 1), dtype=jnp.bool_, device=device)
         return SimEstimates(
             pos=zeros_3d,
             quat=q_identity,
             vel=zeros_3d,
             ang_vel=zeros_3d,
+            accel_bias=zeros_3d,
+            gyro_bias=zeros_3d,
             covariance=covariance,
             use_for_control=use_for_control,
         )
@@ -111,6 +139,8 @@ class UWBData:
     """Latest measured UWB ranges from each drone to each base station."""
     range_std: Array  # (N, M, 1)
     """Standard deviation of the range noise in meters."""
+    estimator_range_std: Array  # (N, M, 1)
+    """Standard deviation assumed by the estimator for UWB ranges."""
     steps: Array  # (N, 1)
     """Last simulation steps that UWB ranges were updated."""
     freq: int = field(pytree_node=False)
@@ -124,9 +154,65 @@ class UWBData:
         base_stations = jnp.array(DEFAULT_UWB_BASE_STATIONS, device=device)
         ranges = jnp.zeros((n_worlds, n_drones, base_stations.shape[0]), device=device)
         range_std = jnp.full((n_worlds, n_drones, 1), range_std, device=device)
+        estimator_range_std = range_std
         steps = -jnp.ones((n_worlds, 1), dtype=jnp.int32, device=device)
         return UWBData(
-            base_stations=base_stations, ranges=ranges, range_std=range_std, steps=steps, freq=freq
+            base_stations=base_stations,
+            ranges=ranges,
+            range_std=range_std,
+            estimator_range_std=estimator_range_std,
+            steps=steps,
+            freq=freq,
+        )
+
+
+@dataclass
+class IMUData:
+    accel: Array  # (N, M, 3)
+    """Latest accelerometer measurement as specific force in the body frame."""
+    gyro: Array  # (N, M, 3)
+    """Latest gyroscope measurement in the body frame."""
+    prev_vel: Array  # (N, M, 3)
+    """Previous ground-truth velocity kept for IMU models that finite-difference velocity."""
+    accel_bias: Array  # (N, M, 3)
+    """Current accelerometer bias in m/s^2."""
+    gyro_bias: Array  # (N, M, 3)
+    """Current gyroscope bias in rad/s."""
+    accel_std: Array  # (N, M, 1)
+    """Standard deviation of accelerometer noise in m/s^2."""
+    gyro_std: Array  # (N, M, 1)
+    """Standard deviation of gyroscope noise in rad/s."""
+    accel_bias_walk_std: Array  # (N, M, 1)
+    """Accelerometer bias random-walk standard deviation in m/s^2/sqrt(s)."""
+    gyro_bias_walk_std: Array  # (N, M, 1)
+    """Gyroscope bias random-walk standard deviation in rad/s/sqrt(s)."""
+
+    @staticmethod
+    def create(
+        n_worlds: int,
+        n_drones: int,
+        device: Device,
+        accel_std: float = 0.05,
+        gyro_std: float = 0.005,
+        accel_bias_walk_std: float = 0.0,
+        gyro_bias_walk_std: float = 0.0,
+    ) -> IMUData:
+        """Create default IMU sensing data."""
+        zeros_3d = jnp.zeros((n_worlds, n_drones, 3), device=device)
+        accel_std = jnp.full((n_worlds, n_drones, 1), accel_std, device=device)
+        gyro_std = jnp.full((n_worlds, n_drones, 1), gyro_std, device=device)
+        accel_bias_walk_std = jnp.full((n_worlds, n_drones, 1), accel_bias_walk_std, device=device)
+        gyro_bias_walk_std = jnp.full((n_worlds, n_drones, 1), gyro_bias_walk_std, device=device)
+        return IMUData(
+            accel=zeros_3d,
+            gyro=zeros_3d,
+            prev_vel=zeros_3d,
+            accel_bias=zeros_3d,
+            gyro_bias=zeros_3d,
+            accel_std=accel_std,
+            gyro_std=gyro_std,
+            accel_bias_walk_std=accel_bias_walk_std,
+            gyro_bias_walk_std=gyro_bias_walk_std,
         )
 
 
@@ -333,6 +419,8 @@ class SimData:
     """Estimated state of the simulation."""
     uwb: UWBData
     """UWB sensing data."""
+    imu: IMUData
+    """IMU sensing data."""
     controls: SimControls
     """Drone controller data."""
     params: SimParams

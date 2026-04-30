@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import jax
@@ -10,10 +11,22 @@ from drone_models.transform import motor_force2rotor_vel
 
 from crazyflow.control import Control
 from crazyflow.sim import Sim
-from crazyflow.sim.uwb import estimate_uwb_state, simulate_uwb
+from crazyflow.sim.uwb import estimate_uwb_imu_state, simulate_imu, simulate_uwb
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+
+@dataclass(frozen=True)
+class SensorConfig:
+    """Sensor noise settings for one UWB+IMU trial."""
+
+    range_std: float
+    estimator_range_std: float
+    accel_std: float
+    gyro_std: float
+    accel_bias_walk_std: float
+    gyro_bias_walk_std: float
 
 
 def figure_eight_control(t: float, n_worlds: int, n_drones: int) -> NDArray:
@@ -35,16 +48,31 @@ def figure_eight_control(t: float, n_worlds: int, n_drones: int) -> NDArray:
     return cmd
 
 
-def configure_uwb_estimation(sim: Sim, range_std: float):
-    range_std_arr = jnp.full_like(sim.data.uwb.range_std, range_std)
+def configure_uwb_estimation(sim: Sim, sensors: SensorConfig):
+    range_std = jnp.full_like(sim.data.uwb.range_std, sensors.range_std)
+    estimator_range_std = jnp.full_like(
+        sim.data.uwb.estimator_range_std, sensors.estimator_range_std
+    )
+    accel_std = jnp.full_like(sim.data.imu.accel_std, sensors.accel_std)
+    gyro_std = jnp.full_like(sim.data.imu.gyro_std, sensors.gyro_std)
+    accel_bias_walk_std = jnp.full_like(
+        sim.data.imu.accel_bias_walk_std, sensors.accel_bias_walk_std
+    )
+    gyro_bias_walk_std = jnp.full_like(sim.data.imu.gyro_bias_walk_std, sensors.gyro_bias_walk_std)
     use_estimate = jnp.ones_like(sim.data.estimates.use_for_control)
     sim.data = sim.data.replace(
-        uwb=sim.data.uwb.replace(range_std=range_std_arr),
+        uwb=sim.data.uwb.replace(range_std=range_std, estimator_range_std=estimator_range_std),
+        imu=sim.data.imu.replace(
+            accel_std=accel_std,
+            gyro_std=gyro_std,
+            accel_bias_walk_std=accel_bias_walk_std,
+            gyro_bias_walk_std=gyro_bias_walk_std,
+        ),
         estimates=sim.data.estimates.replace(use_for_control=use_estimate),
     )
 
-    # Insert UWB sensing and estimation before the controller consumes feedback state.
-    sim.step_pipeline = (simulate_uwb, estimate_uwb_state) + sim.step_pipeline
+    # Insert UWB/IMU sensing and estimation before the controller consumes feedback state.
+    sim.step_pipeline = (simulate_uwb, simulate_imu, estimate_uwb_imu_state) + sim.step_pipeline
     sim.build_step_fn()
 
 
@@ -57,18 +85,19 @@ def set_initial_state(sim: Sim):
     hover_rpm = motor_force2rotor_vel(hover_thrust, params["rpm2thrust"])
     rotor_vel = jnp.ones_like(sim.data.states.rotor_vel, device=sim.device) * hover_rpm
     states = sim.data.states.replace(pos=pos, vel=vel, rotor_vel=rotor_vel)
+    imu = sim.data.imu.replace(prev_vel=vel)
     estimates = sim.data.estimates.replace(
         pos=pos,
         vel=vel,
         quat=states.quat,
         ang_vel=states.ang_vel,
-        covariance=sim.data.estimates.covariance * 0.01,
+        covariance=sim.data.estimates.covariance,
     )
-    sim.data = sim.data.replace(states=states, estimates=estimates)
+    sim.data = sim.data.replace(states=states, estimates=estimates, imu=imu)
 
 
 def run_trial(
-    name: str, range_std: float | None, render: bool = False, duration: float = 20.0
+    name: str, sensors: SensorConfig | None, render: bool = False, duration: float = 120.0
 ) -> dict[str, NDArray]:
     sim = Sim(
         control=Control.state,
@@ -80,10 +109,10 @@ def run_trial(
         rng_key=42,
     )
     set_initial_state(sim)
-    if range_std is not None:
-        configure_uwb_estimation(sim, range_std)
+    if sensors is not None:
+        configure_uwb_estimation(sim, sensors)
 
-    truth, estimate, target = [], [], []
+    time, truth, estimate, target = [], [], [], []
     steps_per_control = sim.freq // sim.control_freq
     for i in range(int(duration * sim.control_freq)):
         t = i / sim.control_freq
@@ -91,8 +120,9 @@ def run_trial(
         sim.state_control(cmd)
         sim.step(steps_per_control)
         truth_pos = np.asarray(jax.device_get(sim.data.states.pos[0, 0]))
+        time.append(t)
         truth.append(truth_pos)
-        if range_std is None:
+        if sensors is None:
             estimate.append(truth_pos)
         else:
             estimate.append(np.asarray(jax.device_get(sim.data.estimates.pos[0, 0])))
@@ -102,6 +132,7 @@ def run_trial(
             sim.render()
 
     sim.close()
+    time = np.array(time)
     truth = np.array(truth)
     estimate = np.array(estimate)
     target = np.array(target)
@@ -110,6 +141,7 @@ def run_trial(
     skip = sim.control_freq
     return {
         "name": name,
+        "time": time,
         "truth": truth,
         "estimate": estimate,
         "target": target,
@@ -119,8 +151,14 @@ def run_trial(
 
 
 def main(plot: bool = False, render: bool = False):
-    trials = [("Perfect knowledge", None), ("UWB high quality", 0.02), ("UWB low quality", 0.30)]
-    results = [run_trial(name, range_std, render=render) for name, range_std in trials]
+    # larger estimator range std for better closed-loop stability
+    trials = [
+        # ("Perfect knowledge", None),
+        # ("UWB+IMU high quality", SensorConfig(0.01, 0.02, 0.03, 0.002, 1e-5, 1e-6))
+        ("UWB+IMU low quality", SensorConfig(0.10, 0.15, 0.03, 0.0025, 0.001, 0.00025))
+        # Abhi values: accel bias 1e-5, gyro bias 1e-6
+    ]
+    results = [run_trial(name, sensors, render=render) for name, sensors in trials]
     for result in results:
         print(
             f"{result['name']}: tracking RMS {result['tracking_rms']:.3f} m, "
@@ -134,9 +172,10 @@ def main(plot: bool = False, render: bool = False):
 def plot_results(results: list[dict[str, NDArray]]):
     import matplotlib.pyplot as plt
 
-    fig = plt.figure(figsize=(11, 5))
-    ax_traj = fig.add_subplot(1, 2, 1, projection="3d")
-    ax_err = fig.add_subplot(1, 2, 2)
+    fig = plt.figure(figsize=(15, 5))
+    ax_traj = fig.add_subplot(1, 3, 1, projection="3d")
+    ax_err = fig.add_subplot(1, 3, 2)
+    ax_est_err = fig.add_subplot(1, 3, 3)
     target = results[0]["target"]
     ax_traj.plot(target[:, 0], target[:, 1], target[:, 2], color="k", label="target")
 
@@ -144,10 +183,14 @@ def plot_results(results: list[dict[str, NDArray]]):
     ys = [target[:, 1]]
     zs = [target[:, 2]]
     for result in results:
+        time = result["time"]
         truth = result["truth"]
+        estimate = result["estimate"]
         ax_traj.plot(truth[:, 0], truth[:, 1], truth[:, 2], label=result["name"])
         err = np.linalg.norm(truth - target, axis=-1)
-        ax_err.plot(err, label=result["name"])
+        ax_err.plot(time, err, label=result["name"])
+        estimate_err = np.linalg.norm(estimate - truth, axis=-1)
+        ax_est_err.plot(time, estimate_err, label=result["name"])
         xs.append(truth[:, 0])
         ys.append(truth[:, 1])
         zs.append(truth[:, 2])
@@ -177,13 +220,24 @@ def plot_results(results: list[dict[str, NDArray]]):
     ax_traj.set_ylabel("y [m]")
     ax_traj.set_zlabel("z [m]")
     ax_err.set_title("Tracking error")
-    ax_err.set_xlabel("Control step")
+    ax_err.set_xlabel("Time [s]")
     ax_err.set_ylabel("Error [m]")
+    ax_est_err.set_title("Position estimate error")
+    ax_est_err.set_xlabel("Time [s]")
+    ax_est_err.set_ylabel("Error [m]")
     ax_traj.legend()
     ax_err.legend()
+    ax_est_err.legend()
     plt.tight_layout()
     plt.show()
 
 
 if __name__ == "__main__":
     main(plot=True, render=False)
+
+
+# Notes with Abhi:
+# - Make sure the distribution for the distance measurements have a bias (3-15cm for low cost [0,15], expensive 1-2cm uniform distribution [0,2])
+# - Fix gravity sign in IMU simulation line 46 uwb.py
+# - Realistic estimation errors: cheap antennas RLS 5-8cm (Abhi), theoretical range with good hardware 1-3cm
+# - Check if the estimator is actually an UKF or EKF
