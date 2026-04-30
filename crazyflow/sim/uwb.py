@@ -5,10 +5,10 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 from drone_estimators.estimator import Estimator
-from drone_estimators.structs import UKFData
 from jax.scipy.spatial.transform import Rotation as R
 
 from crazyflow.control.control import controllable
+from crazyflow.sim.data import UKFData
 from crazyflow.utils import leaf_replace
 
 if TYPE_CHECKING:
