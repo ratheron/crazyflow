@@ -5,14 +5,26 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 from drone_estimators.estimator import Estimator
+from jax import Array
 from jax.scipy.spatial.transform import Rotation as R
 
 from crazyflow.control.control import controllable
-from crazyflow.sim.data import UKFData
+from crazyflow.sim.data import EKFData
 from crazyflow.utils import leaf_replace
 
 if TYPE_CHECKING:
     from crazyflow.sim.data import SimData
+
+
+def reset_uwb_bias(data: SimData, mask: Array | None = None) -> SimData:
+    """Sample a persistent UWB bias for the selected worlds."""
+    key, bias_key = jax.random.split(data.core.rng_key)
+    bias_scale = jnp.broadcast_to(data.uwb.range_bias_max, data.uwb.range_bias.shape)
+    range_bias = jax.random.uniform(
+        bias_key, data.uwb.range_bias.shape, dtype=data.uwb.range_bias.dtype
+    )
+    uwb = leaf_replace(data.uwb, mask, range_bias=range_bias * bias_scale)
+    return data.replace(uwb=uwb, core=data.core.replace(rng_key=key))
 
 
 def simulate_uwb(data: SimData) -> SimData:
@@ -22,7 +34,8 @@ def simulate_uwb(data: SimData) -> SimData:
 
     key, subkey = jax.random.split(data.core.rng_key)
     ranges = jnp.linalg.norm(data.states.pos[..., None, :] - uwb.base_stations, axis=-1)
-    ranges = jnp.maximum(ranges + jax.random.normal(subkey, ranges.shape) * uwb.range_std, 0.0)
+    ranges = ranges + uwb.range_bias + jax.random.normal(subkey, ranges.shape) * uwb.range_std
+    ranges = jnp.maximum(ranges, 0.0)
 
     uwb = leaf_replace(uwb, mask, ranges=ranges, steps=data.core.steps)
     return data.replace(uwb=uwb, core=data.core.replace(rng_key=key))
@@ -43,9 +56,8 @@ def simulate_imu(data: SimData) -> SimData:
         * dt_sqrt
     )
     world_accel = data.states_deriv.acc
-    accel = (
-        R.from_quat(data.states.quat).inv().apply(world_accel - data.params.gravity_vec)
-    )  # TODO sign is wrong!
+    # IMUs measure specific force in the body frame: f_b = R_wb^T * (a_w - g_w).
+    accel = R.from_quat(data.states.quat).inv().apply(world_accel - data.params.gravity_vec)
     gyro = data.states.ang_vel
     accel = accel + accel_bias + jax.random.normal(accel_key, accel.shape) * data.imu.accel_std
     gyro = gyro + gyro_bias + jax.random.normal(gyro_key, gyro.shape) * data.imu.gyro_std
@@ -62,11 +74,11 @@ def simulate_imu(data: SimData) -> SimData:
 
 
 def estimate_uwb_imu_state(data: SimData) -> SimData:
-    """Estimate full state from one UWB tag and IMU measurements."""
+    """Estimate full state from one UWB tag and IMU measurements with an EKF-style filter."""
     n_worlds, n_drones, n_anchors = data.uwb.ranges.shape
     state_dim = data.estimates.covariance.shape[-1]
     n_sigmas = 2 * state_dim + 1
-    ukf_data = UKFData(
+    estimator_data = EKFData(
         pos=data.estimates.pos,
         quat=data.estimates.quat,
         vel=data.estimates.vel,
@@ -87,8 +99,8 @@ def estimate_uwb_imu_state(data: SimData) -> SimData:
         accel_bias=data.estimates.accel_bias,
         gyro_bias=data.estimates.gyro_bias,
     )
-    ukf_data = uwb_imu_step(
-        ukf_data,
+    estimator_data = uwb_imu_step(
+        estimator_data,
         ranges=data.uwb.ranges,
         base_stations=data.uwb.base_stations,
         imu_accel=data.imu.accel,
@@ -102,19 +114,19 @@ def estimate_uwb_imu_state(data: SimData) -> SimData:
         uwb_updated=data.uwb.steps == data.core.steps,
     )
     estimates = data.estimates.replace(
-        pos=ukf_data.pos,
-        quat=ukf_data.quat,
-        vel=ukf_data.vel,
-        ang_vel=ukf_data.ang_vel,
-        accel_bias=ukf_data.accel_bias,
-        gyro_bias=ukf_data.gyro_bias,
-        covariance=ukf_data.covariance,
+        pos=estimator_data.pos,
+        quat=estimator_data.quat,
+        vel=estimator_data.vel,
+        ang_vel=estimator_data.ang_vel,
+        accel_bias=estimator_data.accel_bias,
+        gyro_bias=estimator_data.gyro_bias,
+        covariance=estimator_data.covariance,
     )
     return data.replace(estimates=estimates)
 
 
 def uwb_imu_step(
-    data: UKFData,
+    data: EKFData,
     ranges: Array,
     base_stations: Array,
     imu_accel: Array,
@@ -126,14 +138,14 @@ def uwb_imu_step(
     accel_bias_walk_std: Array,
     gyro_bias_walk_std: Array,
     uwb_updated: Array,
-) -> UKFData:
+) -> EKFData:
     """Step a full-state UWB+IMU estimator using one UWB tag and IMU measurements.
 
-    The state is [pos, quat, vel, ang_vel, accel_bias, gyro_bias]. IMU acceleration and gyro are
-    used as propagation inputs after subtracting the estimated biases, while UWB ranges provide
-    the correction.
+    The state is [pos, quat, vel, ang_vel, accel_bias, gyro_bias]. This is an EKF-style
+    implementation: it propagates the mean through the nonlinear process model, uses a Jacobian
+    for covariance prediction, and linearizes the range measurement model for the correction.
     """
-    x = UKFData.as_state_array(data)
+    x = EKFData.as_state_array(data)
     n = x.shape[-1]
     if n not in (13, 19):
         raise ValueError(f"UWB+IMU estimator expects a 13D or 19D state, got {n}D")
@@ -176,14 +188,14 @@ def uwb_imu_step(
     x_out = jnp.where(uwb_updated[..., None], x_corr, x_pred)
     p_out = jnp.where(uwb_updated[..., None, None], p_corr, p_pred)
 
-    return UKFData.from_state_array(
+    return EKFData.from_state_array(
         data.replace(covariance=p_out, z=ranges, u=jnp.concat((imu_accel, imu_gyro), axis=-1)),
         x_out,
     )
 
 
 class UWBIMUKalmanFilter(Estimator):
-    """Functional Kalman filter wrapper for UWB range and IMU fusion."""
+    """Functional EKF-style wrapper for UWB range and IMU fusion."""
 
     def __init__(
         self,
@@ -204,7 +216,7 @@ class UWBIMUKalmanFilter(Estimator):
         self.gyro_std = jnp.asarray(gyro_std)
         self.accel_bias_walk_std = jnp.asarray(accel_bias_walk_std)
         self.gyro_bias_walk_std = jnp.asarray(gyro_bias_walk_std)
-        self.data = UKFData.create_empty(accel_bias=True, gyro_bias=True, dim_u=dim_u, dim_z=dim_z)
+        self.data = EKFData.create_empty(accel_bias=True, gyro_bias=True, dim_u=dim_u, dim_z=dim_z)
         self.data = self.data.replace(
             covariance=jnp.eye(dim_x) * 0.01,
             sigmas_f=jnp.zeros((2 * dim_x + 1, dim_x)),
@@ -212,7 +224,7 @@ class UWBIMUKalmanFilter(Estimator):
             dt=dt,
         )
 
-    def step(self, ranges: Array, imu_accel: Array, imu_gyro: Array, gravity_vec: Array) -> UKFData:
+    def step(self, ranges: Array, imu_accel: Array, imu_gyro: Array, gravity_vec: Array) -> EKFData:
         """Step the estimator with one set of range and IMU measurements."""
         self.data = uwb_imu_step(
             self.data,
@@ -317,7 +329,9 @@ def _uwb_imu_covariance_predict(
     flat_x = x.reshape((-1, dim_x))
     flat_accel = imu_accel.reshape((-1, 3))
     flat_gyro = imu_gyro.reshape((-1, 3))
-    flat_gravity = gravity_vec.reshape((-1, 3))
+    gravity = jnp.broadcast_to(gravity_vec, (*x.shape[:-1], 3))
+    flat_gravity = gravity.reshape((-1, 3))
+    # Covariance propagation is EKF-style: linearize the nonlinear process around the current mean.
     jacobian = jax.jacfwd(_uwb_imu_process_one, argnums=0)
     flat_transition = jax.vmap(jacobian, in_axes=(0, 0, 0, 0, None))(
         flat_x, flat_accel, flat_gyro, flat_gravity, dt

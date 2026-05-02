@@ -139,6 +139,10 @@ class UWBData:
     """Latest measured UWB ranges from each drone to each base station."""
     range_std: Array  # (N, M, 1)
     """Standard deviation of the range noise in meters."""
+    range_bias: Array  # (N, M, 8)
+    """Persistent positive bias added to each UWB range measurement."""
+    range_bias_max: Array  # (N, M, 1)
+    """Upper bound used when sampling UWB range bias at reset time."""
     estimator_range_std: Array  # (N, M, 1)
     """Standard deviation assumed by the estimator for UWB ranges."""
     steps: Array  # (N, 1)
@@ -154,12 +158,16 @@ class UWBData:
         base_stations = jnp.array(DEFAULT_UWB_BASE_STATIONS, device=device)
         ranges = jnp.zeros((n_worlds, n_drones, base_stations.shape[0]), device=device)
         range_std = jnp.full((n_worlds, n_drones, 1), range_std, device=device)
+        range_bias = jnp.zeros_like(ranges)
+        range_bias_max = jnp.zeros((n_worlds, n_drones, 1), device=device)
         estimator_range_std = range_std
         steps = -jnp.ones((n_worlds, 1), dtype=jnp.int32, device=device)
         return UWBData(
             base_stations=base_stations,
             ranges=ranges,
             range_std=range_std,
+            range_bias=range_bias,
+            range_bias_max=range_bias_max,
             estimator_range_std=estimator_range_std,
             steps=steps,
             freq=freq,
@@ -433,8 +441,8 @@ import numpy as np
 
 
 @dataclass
-class UKFData:
-    """TODO."""
+class EKFData:
+    """State container for the local UWB+IMU EKF pipeline."""
 
     pos: Array
     quat: Array
@@ -464,7 +472,7 @@ class UKFData:
         gyro_bias: bool = False,
         dim_u: int = 4,
         dim_z: int = 7,
-    ) -> UKFData:
+    ) -> EKFData:
         """TODO."""
         pos = np.zeros(3)
         quat = np.array([0, 0, 0, 1])
@@ -536,7 +544,7 @@ class UKFData:
         dist_t: Array | None = None,
         accel_bias: Array | None = None,
         gyro_bias: Array | None = None,
-    ) -> UKFData:
+    ) -> EKFData:
         """TODO."""
         dim_x = 13
         if rotor_vel is not None:
@@ -578,7 +586,7 @@ class UKFData:
         )
 
     @classmethod
-    def as_state_array(cls, data: UKFData) -> Array:
+    def as_state_array(cls, data: EKFData) -> Array:
         """Returns the state as an array."""
         xp = data.pos.__array_namespace__()
         x = xp.concat((data.pos, data.quat, data.vel, data.ang_vel), axis=-1)
@@ -595,7 +603,7 @@ class UKFData:
         return x
 
     @classmethod
-    def from_state_array(cls, data: UKFData, array: Array) -> UKFData:
+    def from_state_array(cls, data: EKFData, array: Array) -> EKFData:
         """Updates data in the given structure based on a given array."""
         pos = array[..., 0:3]
         quat = array[..., 3:7]
@@ -640,7 +648,7 @@ class UKFData:
         )
 
     @classmethod
-    def get_state_dim(cls, data: UKFData) -> int:
+    def get_state_dim(cls, data: EKFData) -> int:
         """Returns the dimension of the state."""
         dim_x = 13
         if data.rotor_vel is not None:

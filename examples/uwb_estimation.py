@@ -1,20 +1,15 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from drone_models.core import load_params
 from drone_models.transform import motor_force2rotor_vel
+from numpy.typing import NDArray
 
 from crazyflow.control import Control
 from crazyflow.sim import Sim
-from crazyflow.sim.uwb import estimate_uwb_imu_state, simulate_imu, simulate_uwb
-
-if TYPE_CHECKING:
-    from numpy.typing import NDArray
+from crazyflow.sim.uwb import estimate_uwb_imu_state, reset_uwb_bias, simulate_imu, simulate_uwb
 
 
 @dataclass(frozen=True)
@@ -22,6 +17,7 @@ class SensorConfig:
     """Sensor noise settings for one UWB+IMU trial."""
 
     range_std: float
+    range_bias_max: float
     estimator_range_std: float
     accel_std: float
     gyro_std: float
@@ -50,6 +46,7 @@ def figure_eight_control(t: float, n_worlds: int, n_drones: int) -> NDArray:
 
 def configure_uwb_estimation(sim: Sim, sensors: SensorConfig):
     range_std = jnp.full_like(sim.data.uwb.range_std, sensors.range_std)
+    range_bias_max = jnp.full_like(sim.data.uwb.range_bias_max, sensors.range_bias_max)
     estimator_range_std = jnp.full_like(
         sim.data.uwb.estimator_range_std, sensors.estimator_range_std
     )
@@ -61,7 +58,11 @@ def configure_uwb_estimation(sim: Sim, sensors: SensorConfig):
     gyro_bias_walk_std = jnp.full_like(sim.data.imu.gyro_bias_walk_std, sensors.gyro_bias_walk_std)
     use_estimate = jnp.ones_like(sim.data.estimates.use_for_control)
     sim.data = sim.data.replace(
-        uwb=sim.data.uwb.replace(range_std=range_std, estimator_range_std=estimator_range_std),
+        uwb=sim.data.uwb.replace(
+            range_std=range_std,
+            range_bias_max=range_bias_max,
+            estimator_range_std=estimator_range_std,
+        ),
         imu=sim.data.imu.replace(
             accel_std=accel_std,
             gyro_std=gyro_std,
@@ -70,10 +71,30 @@ def configure_uwb_estimation(sim: Sim, sensors: SensorConfig):
         ),
         estimates=sim.data.estimates.replace(use_for_control=use_estimate),
     )
+    sim.default_data = sim.default_data.replace(
+        uwb=sim.default_data.uwb.replace(
+            range_std=range_std,
+            range_bias_max=range_bias_max,
+            estimator_range_std=estimator_range_std,
+        ),
+        imu=sim.default_data.imu.replace(
+            accel_std=accel_std,
+            gyro_std=gyro_std,
+            accel_bias_walk_std=accel_bias_walk_std,
+            gyro_bias_walk_std=gyro_bias_walk_std,
+        ),
+        estimates=sim.default_data.estimates.replace(use_for_control=use_estimate),
+    )
 
     # Insert UWB/IMU sensing and estimation before the controller consumes feedback state.
-    sim.step_pipeline = (simulate_uwb, simulate_imu, estimate_uwb_imu_state) + sim.step_pipeline
+    if reset_uwb_bias not in sim.reset_pipeline:
+        sim.reset_pipeline += (reset_uwb_bias,)
+    sensor_pipeline = (simulate_uwb, simulate_imu, estimate_uwb_imu_state)
+    if sim.step_pipeline[: len(sensor_pipeline)] != sensor_pipeline:
+        sim.step_pipeline = sensor_pipeline + sim.step_pipeline
+    sim.build_reset_fn()
     sim.build_step_fn()
+    sim.data = reset_uwb_bias(sim.data)
 
 
 def set_initial_state(sim: Sim):
@@ -94,6 +115,17 @@ def set_initial_state(sim: Sim):
         covariance=sim.data.estimates.covariance,
     )
     sim.data = sim.data.replace(states=states, estimates=estimates, imu=imu)
+    sim.default_data = sim.default_data.replace(
+        states=sim.default_data.states.replace(pos=pos, vel=vel, rotor_vel=rotor_vel),
+        estimates=sim.default_data.estimates.replace(
+            pos=pos,
+            vel=vel,
+            quat=states.quat,
+            ang_vel=states.ang_vel,
+            covariance=sim.default_data.estimates.covariance,
+        ),
+        imu=sim.default_data.imu.replace(prev_vel=vel),
+    )
 
 
 def run_trial(
@@ -153,9 +185,9 @@ def run_trial(
 def main(plot: bool = False, render: bool = False):
     # larger estimator range std for better closed-loop stability
     trials = [
-        # ("Perfect knowledge", None),
-        # ("UWB+IMU high quality", SensorConfig(0.01, 0.02, 0.03, 0.002, 1e-5, 1e-6))
-        ("UWB+IMU low quality", SensorConfig(0.10, 0.15, 0.03, 0.0025, 0.001, 0.00025))
+        ("Perfect knowledge", None),
+        ("UWB+IMU high quality", SensorConfig(0.01, 0.02, 0.02, 0.03, 0.002, 1e-5, 1e-6)),
+        ("UWB+IMU low quality", SensorConfig(0.10, 0.15, 0.15, 0.03, 0.0025, 0.001, 0.00025)),
         # Abhi values: accel bias 1e-5, gyro bias 1e-6
     ]
     results = [run_trial(name, sensors, render=render) for name, sensors in trials]
@@ -234,10 +266,3 @@ def plot_results(results: list[dict[str, NDArray]]):
 
 if __name__ == "__main__":
     main(plot=True, render=False)
-
-
-# Notes with Abhi:
-# - Make sure the distribution for the distance measurements have a bias (3-15cm for low cost [0,15], expensive 1-2cm uniform distribution [0,2])
-# - Fix gravity sign in IMU simulation line 46 uwb.py
-# - Realistic estimation errors: cheap antennas RLS 5-8cm (Abhi), theoretical range with good hardware 1-3cm
-# - Check if the estimator is actually an UKF or EKF

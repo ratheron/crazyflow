@@ -9,6 +9,7 @@ import pytest
 
 from crazyflow.sim import Sim
 from crazyflow.sim.sensors import _camera_rays, build_render_depth_fn, render_depth
+from crazyflow.sim.uwb import estimate_uwb_imu_state, reset_uwb_bias, simulate_imu, simulate_uwb
 
 
 @pytest.mark.unit
@@ -50,3 +51,53 @@ def test_build_render_depth_fn():
     )
     dist = render_depth_fn(sim)
     assert dist.shape == (3, 15, 20), f"Expected shape (3, 15, 20), got {dist.shape}"
+
+
+@pytest.mark.unit
+def test_simulate_uwb_applies_persistent_bias():
+    """Test that UWB simulation adds the configured persistent range bias."""
+    sim = Sim(n_worlds=1, n_drones=1)
+    range_bias = jnp.full_like(sim.data.uwb.range_bias, 0.1)
+    sim.data = sim.data.replace(
+        uwb=sim.data.uwb.replace(
+            range_std=jnp.zeros_like(sim.data.uwb.range_std),
+            range_bias=range_bias,
+        )
+    )
+
+    sim.data = simulate_uwb(sim.data)
+
+    true_ranges = jnp.linalg.norm(
+        sim.data.states.pos[..., None, :] - sim.data.uwb.base_stations, axis=-1
+    )
+    assert jnp.allclose(sim.data.uwb.ranges, true_ranges + range_bias)
+
+
+@pytest.mark.unit
+def test_reset_uwb_bias_masked():
+    """Test that reset-time UWB bias sampling respects the world mask."""
+    sim = Sim(n_worlds=2, n_drones=1)
+    initial_bias = jnp.full_like(sim.data.uwb.range_bias, 0.3)
+    range_bias_max = jnp.full_like(sim.data.uwb.range_bias_max, 0.2)
+    sim.data = sim.data.replace(
+        uwb=sim.data.uwb.replace(range_bias=initial_bias, range_bias_max=range_bias_max)
+    )
+
+    data = reset_uwb_bias(sim.data, jnp.array([True, False]))
+
+    assert jnp.all(data.uwb.range_bias[0] >= 0.0)
+    assert jnp.all(data.uwb.range_bias[0] <= 0.2)
+    assert jnp.all(data.uwb.range_bias[1] == initial_bias[1])
+
+
+@pytest.mark.unit
+def test_batched_uwb_imu_estimator_shapes():
+    """Test that the UWB+IMU EKF supports batched worlds and drones."""
+    sim = Sim(n_worlds=2, n_drones=2)
+    data = simulate_uwb(sim.data)
+    data = simulate_imu(data)
+    data = estimate_uwb_imu_state(data)
+
+    assert data.estimates.pos.shape == (2, 2, 3)
+    assert data.estimates.quat.shape == (2, 2, 4)
+    assert data.estimates.covariance.shape == (2, 2, 19, 19)
